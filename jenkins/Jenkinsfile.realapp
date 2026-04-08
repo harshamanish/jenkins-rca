@@ -1,0 +1,205 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'FAILURE_TYPE',
+            choices: ['npe', 'oom', 'docker', 'db_timeout', 'dep'],
+            description: 'Which failure to simulate'
+        )
+        string(
+            name: 'RCA_API_URL',
+            defaultValue: 'https://jenkins-rca-api-i7vb464gnq-uc.a.run.app',
+            description: 'RCA API Cloud Run URL'
+        )
+        booleanParam(
+            name: 'AUTO_APPROVE',
+            defaultValue: false,
+            description: 'Skip approval gate'
+        )
+    }
+
+    environment {
+        BUILD_LOG_PATH  = "/tmp/rca-build-${BUILD_NUMBER}.log"
+        RCA_RESULT_PATH = "/tmp/rca-result-${BUILD_NUMBER}.json"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "Checking out harshamanish/jenkins-rca..."
+                echo "Branch: main"
+            }
+        }
+
+        stage('Build + Test') {
+            steps {
+                script {
+                    echo "Running failure: ${params.FAILURE_TYPE}"
+                    sh """
+                        set +e
+                        python3 -c "
+import sys
+failure = '${params.FAILURE_TYPE}'
+if failure == 'npe':
+    print('Running AuthService tests...')
+    print('[ERROR] java.lang.NullPointerException: Cannot invoke method getUser() on null object')
+    print('  at com.example.AuthService.validate(AuthService.java:42)')
+    print('  at com.example.ApiController.handle(ApiController.java:88)')
+    print('BUILD FAILED')
+    sys.exit(1)
+elif failure == 'oom':
+    print('[ERROR] java.lang.OutOfMemoryError: Java heap space')
+    print('  at com.example.DataProcessor.loadAll(DataProcessor.java:210)')
+    print('BUILD FAILED')
+    sys.exit(1)
+elif failure == 'docker':
+    print('[ERROR] unauthorized: authentication required')
+    print('Error pulling image docker.io/node:18-alpine')
+    print('BUILD FAILED')
+    sys.exit(1)
+elif failure == 'db_timeout':
+    print('[ERROR] com.example.db.PoolTimeoutException: Timed out waiting for connection after 30000ms')
+    print('  at com.example.db.ConnectionPool.acquire(ConnectionPool.java:88)')
+    print('BUILD FAILED')
+    sys.exit(1)
+elif failure == 'dep':
+    print('[ERROR] Failed to execute goal org.apache.maven.plugins:maven-dependency-plugin')
+    print('Conflicting versions for spring-boot-starter-web: 2.7.5 vs 3.1.0')
+    print('BUILD FAILED')
+    sys.exit(1)
+" 2>&1 | tee ${BUILD_LOG_PATH}
+                        exit \${PIPESTATUS[0]}
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            script {
+                echo ""
+                echo "========================================================"
+                echo "  BUILD FAILED — Starting RCA Agent Pipeline"
+                echo "========================================================"
+
+                def buildLog = sh(
+                    script: "cat ${BUILD_LOG_PATH} 2>/dev/null || echo 'Log unavailable'",
+                    returnStdout: true
+                ).trim()
+
+                echo "Log size: ${buildLog.length()} chars"
+                echo "Calling RCA API: ${params.RCA_API_URL}"
+
+                def rcaPayload = groovy.json.JsonOutput.toJson([
+                    jenkins_log:  buildLog,
+                    job_name:     env.JOB_NAME,
+                    build_number: env.BUILD_NUMBER.toInteger()
+                ])
+
+                writeFile file: '/tmp/rca-payload.json', text: rcaPayload
+
+                def httpStatus = sh(
+                    script: """
+                        curl -s -w "%{http_code}" \
+                          -X POST ${params.RCA_API_URL}/analyze \
+                          -H 'Content-Type: application/json' \
+                          -d @/tmp/rca-payload.json \
+                          -o ${RCA_RESULT_PATH}
+                    """,
+                    returnStdout: true
+                ).trim()
+
+                echo "RCA API response: HTTP ${httpStatus}"
+
+                if (httpStatus != '200') {
+                    echo "ERROR: RCA API returned HTTP ${httpStatus}"
+                    return
+                }
+
+                def rca = readJSON file: RCA_RESULT_PATH
+
+                echo ""
+                echo "========================================================"
+                echo "  ROOT CAUSE ANALYSIS RESULT"
+                echo "========================================================"
+                echo "  ID         : ${rca.id}"
+                echo "  Error Type : ${rca.error_type}"
+                echo "  Confidence : ${(rca.confidence * 100).toInteger()}%"
+                echo "  Root Cause : ${rca.root_cause}"
+                echo "  Fix        : ${rca.fix_suggestion}"
+                echo ""
+                if (rca.pr_url) {
+                    echo "  ★ PR CREATED: ${rca.pr_url}"
+                    echo "  Branch     : ${rca.branch_name}"
+                    echo "  Diff       : ${rca.diff_summary}"
+                }
+                echo ""
+                echo "  Similar Issues from Vertex AI Vector Search:"
+                rca.similar_issues?.each { i ->
+                    echo "    [${i.id}] score=${i.score}  ${i.title}"
+                }
+                echo ""
+                echo "  Agent Trace:"
+                rca.agent_trace?.each { s -> echo "    • ${s}" }
+                echo "========================================================"
+
+                if (rca.confidence < 0.6) {
+                    echo "Confidence too low — skipping approval gate"
+                    return
+                }
+
+                def approved = params.AUTO_APPROVE
+                if (!approved) {
+                    echo ""
+                    echo "Waiting for approval (30 min timeout)..."
+                    echo "PR to review: ${rca.pr_url ?: 'See fix above'}"
+                    echo ""
+                    try {
+                        input(
+                            id:      'RCAApproval',
+                            message: "RCA complete — approve the fix?",
+                            ok:      'YES — Apply Fix'
+                        )
+                        approved = true
+                        echo "Approved!"
+                    } catch (e) {
+                        echo "Rejected — no changes applied"
+                        sh "curl -s -X POST ${params.RCA_API_URL}/reject/${rca.id} -G --data-urlencode 'reason=Rejected in Jenkins'"
+                        return
+                    }
+                }
+
+                if (approved) {
+                    echo "Applying fix via MCP tools..."
+                    def approveStatus = sh(
+                        script: """
+                            curl -s -w "%{http_code}" \
+                              -X POST ${params.RCA_API_URL}/approve/${rca.id} \
+                              -H 'Content-Type: application/json' \
+                              -d '{"note":"Approved in Jenkins","retry_build":true}' \
+                              -o /tmp/approve-result.json
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (approveStatus == '200') {
+                        def ar = readJSON file: '/tmp/approve-result.json'
+                        echo ""
+                        echo "========================================================"
+                        echo "  FIX APPLIED"
+                        echo "  GitHub Issue : ${ar.github_issue_url}"
+                        echo "  PR URL       : ${ar.pr_url}"
+                        echo "========================================================"
+                    }
+                }
+            }
+        }
+
+        always {
+            archiveArtifacts artifacts: '/tmp/*.json', allowEmptyArchive: true
+            echo "Build complete: ${currentBuild.result}"
+        }
+    }
+}
